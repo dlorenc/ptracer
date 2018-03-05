@@ -13,6 +13,7 @@ import (
 var syscalls = map[int64]bool{
 	syscall.SYS_OPEN:   true,
 	syscall.SYS_OPENAT: true,
+	syscall.SYS_CREAT:  true,
 }
 
 type abspath string
