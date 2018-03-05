@@ -15,6 +15,17 @@ var syscalls = map[int64]bool{
 	syscall.SYS_OPENAT: true,
 }
 
+type abspath string
+
+func MakeAbs(path string, wd string) abspath {
+	if filepath.IsAbs(path) {
+		return abspath(path)
+	}
+	return abspath(filepath.Join(wd, path))
+}
+
+var files = map[abspath]struct{}{}
+
 func main() {
 	var regs syscall.PtraceRegs
 
@@ -37,44 +48,75 @@ func main() {
 		fmt.Printf("Wait returned: %v\n", err)
 	}
 
-	pid := cmd.Process.Pid
+	parentPid := cmd.Process.Pid
 	exit := true
 
+	if err := syscall.PtraceSetOptions(parentPid, syscall.PTRACE_O_TRACEFORK|syscall.PTRACE_O_TRACEVFORK|syscall.PTRACE_O_TRACECLONE|syscall.PTRACE_O_TRACEEXEC|syscall.PTRACE_O_TRACEEXIT); err != nil {
+		panic(err)
+	}
+
+	processState := map[int]bool{}
+	processState[parentPid] = exit
+
+	currentPid := parentPid
+loop:
 	for {
-		if exit {
-			err = syscall.PtraceGetRegs(pid, &regs)
+		if err := syscall.PtraceSyscall(currentPid, 0); err != nil {
+			panic(err)
+		}
+
+		var wstatus syscall.WaitStatus
+		if currentPid, err = syscall.Wait4(-1, &wstatus, 0, nil); err != nil {
+			panic(err)
+		}
+
+		switch wstatus >> 16 {
+		case syscall.PTRACE_EVENT_CLONE:
+			fmt.Println("clone")
+			evt, _ := syscall.PtraceGetEventMsg(currentPid)
+			fmt.Println("New pid: ", evt)
+		case syscall.PTRACE_EVENT_EXEC:
+			fmt.Println("exec")
+		case syscall.PTRACE_EVENT_EXIT:
+			fmt.Println("exit")
+			evt, _ := syscall.PtraceGetEventMsg(currentPid)
+			fmt.Println("Status: ", evt)
+			break loop
+		case syscall.PTRACE_EVENT_FORK:
+			fmt.Println("fork")
+			evt, _ := syscall.PtraceGetEventMsg(currentPid)
+			fmt.Println("New pid: ", evt)
+		case syscall.PTRACE_EVENT_VFORK:
+			fmt.Println("vfork")
+			evt, _ := syscall.PtraceGetEventMsg(currentPid)
+			fmt.Println("New pid: ", evt)
+		case syscall.PTRACE_EVENT_VFORK_DONE:
+			fmt.Println("vfork done")
+			evt, _ := syscall.PtraceGetEventMsg(currentPid)
+			fmt.Println("New pid: ", evt)
+		}
+
+		processState[currentPid] = !processState[currentPid]
+
+		if processState[currentPid] {
+			err = syscall.PtraceGetRegs(currentPid, &regs)
 			if err != nil {
 				break
 			}
 			name, _ := sec.ScmpSyscall(regs.Orig_rax).GetName()
-			fmt.Printf("%s\n", name)
 
 			if _, ok := syscalls[int64(regs.Orig_rax)]; ok {
-				path := peekString(pid, uintptr(regs.Rdi))
-				if !filepath.IsAbs(path) {
-					wd, _ := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
-					path = filepath.Join(wd, path)
+				path := peekString(currentPid, uintptr(regs.Rdi))
+				flags := regs.Rsi
+				if flags&uint64(os.O_WRONLY|os.O_RDWR) != 0 {
+					wd, _ := os.Readlink(fmt.Sprintf("/proc/%d/cwd", currentPid))
+					absPath := MakeAbs(path, wd)
+					files[absPath] = struct{}{}
+					fmt.Println(name, currentPid, absPath)
 				}
-				fmt.Println(name)
-				fmt.Println(path)
 			}
 		}
-
-		if regs.Orig_rax == syscall.SYS_EXIT || regs.Orig_rax == syscall.SYS_EXIT_GROUP {
-			break
-		}
-
-		if err := syscall.PtraceSyscall(pid, 0); err != nil {
-			panic(err)
-		}
-
-		if _, err := syscall.Wait4(pid, nil, 0, nil); err != nil {
-			panic(err)
-		}
-
-		exit = !exit
 	}
-
 }
 
 func peekString(pid int, addr uintptr) string {
